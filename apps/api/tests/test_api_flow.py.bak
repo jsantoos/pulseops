@@ -1,0 +1,1276 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+os.environ["PULSEOPS_DATABASE_URL"] = "sqlite+pysqlite:///:memory:"
+os.environ["PULSEOPS_AUTH_SECRET_KEY"] = "test-secret-with-sufficient-entropy-123456"
+
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from pulseops_api.db.base import Base
+from pulseops_api.db.session import get_db
+from pulseops_api.main import app
+
+engine = create_engine(
+    "sqlite+pysqlite:///:memory:",
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
+TestingSession = sessionmaker(bind=engine, expire_on_commit=False)
+Base.metadata.create_all(engine)
+
+
+def override_db():
+    with TestingSession() as db:
+        yield db
+
+
+app.dependency_overrides[get_db] = override_db
+client = TestClient(app)
+APP_HEADERS = {"X-PulseOps-Request": "web"}
+
+
+def bootstrap_once() -> dict[str, object]:
+    status = client.get("/v1/auth/bootstrap-status")
+    assert status.status_code == 200
+    if status.json()["bootstrap_required"]:
+        response = client.post(
+            "/v1/auth/bootstrap",
+            headers=APP_HEADERS,
+            json={
+                "email": "owner@example.com",
+                "password": "correct-horse-battery-staple",
+                "full_name": "Owner Example",
+                "organization_name": "Test Tenant",
+            },
+        )
+        assert response.status_code == 201, response.text
+        return response.json()
+    response = client.post(
+        "/v1/auth/login",
+        headers=APP_HEADERS,
+        json={
+            "email": "owner@example.com",
+            "password": "correct-horse-battery-staple",
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def create_tenant(name: str) -> str:
+    bootstrap_once()
+    response = client.post(
+        "/v1/organizations", headers=APP_HEADERS, json={"name": name}
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["id"]
+
+
+def tenant_headers(org_id: str, *, mutate: bool = False) -> dict[str, str]:
+    headers = {"X-PulseOps-Organization": org_id}
+    if mutate:
+        headers.update(APP_HEADERS)
+    return headers
+
+
+def test_health() -> None:
+    assert client.get("/health").json() == {"status": "ok"}
+
+
+def test_authentication_and_me() -> None:
+    auth = bootstrap_once()
+    assert auth["user"]["email"] == "owner@example.com"
+    assert auth["user"]["memberships"]
+    me = client.get("/v1/auth/me")
+    assert me.status_code == 200
+    assert me.json()["user"]["full_name"] == "Owner Example"
+
+
+def test_unauthenticated_opportunities_are_rejected() -> None:
+    anonymous = TestClient(app)
+    response = anonymous.get("/v1/opportunities")
+    assert response.status_code == 401
+
+
+def test_end_to_end_dataset_to_opportunity() -> None:
+    org_id = create_tenant("Exemplo Diagnosticos")
+    sample = Path("datasets/sample/operations.json").read_bytes()
+    upload = client.post(
+        "/v1/datasets",
+        headers=tenant_headers(org_id, mutate=True),
+        files={"file": ("operations.json", sample, "application/json")},
+    )
+    assert upload.status_code == 201, upload.text
+    dataset_id = upload.json()["id"]
+    analyzed = client.post(
+        f"/v1/datasets/{dataset_id}/analyze",
+        headers=tenant_headers(org_id, mutate=True),
+    )
+    assert analyzed.status_code == 200, analyzed.text
+    assert analyzed.json()["opportunity_count"] >= 1
+    listed = client.get("/v1/opportunities", headers=tenant_headers(org_id))
+    assert listed.status_code == 200
+    first_count = len(listed.json())
+    assert first_count >= 1
+
+    repeated = client.post(
+        f"/v1/datasets/{dataset_id}/analyze",
+        headers=tenant_headers(org_id, mutate=True),
+    )
+    assert repeated.status_code == 200
+    listed_again = client.get("/v1/opportunities", headers=tenant_headers(org_id))
+    assert len(listed_again.json()) == first_count
+
+
+def test_cross_tenant_dataset_access_is_hidden() -> None:
+    org_a = create_tenant("Tenant A")
+    org_b = create_tenant("Tenant B")
+    sample = Path("datasets/sample/operations.json").read_bytes()
+    uploaded = client.post(
+        "/v1/datasets",
+        headers=tenant_headers(org_a, mutate=True),
+        files={"file": ("operations.json", sample, "application/json")},
+    )
+    dataset_id = uploaded.json()["id"]
+    forbidden = client.post(
+        f"/v1/datasets/{dataset_id}/analyze",
+        headers=tenant_headers(org_b, mutate=True),
+    )
+    assert forbidden.status_code == 404
+
+
+def test_csv_bundle_to_opportunities() -> None:
+    org_id = create_tenant("CSV Diagnosticos")
+    base = Path("datasets/csv-sample")
+    files = {
+        "equipment": ("equipment.csv", (base / "equipment.csv").read_bytes(), "text/csv"),
+        "availability": (
+            "availability.csv",
+            (base / "availability.csv").read_bytes(),
+            "text/csv",
+        ),
+        "appointments": (
+            "appointments.csv",
+            (base / "appointments.csv").read_bytes(),
+            "text/csv",
+        ),
+        "executions": (
+            "executions.csv",
+            (base / "executions.csv").read_bytes(),
+            "text/csv",
+        ),
+    }
+    uploaded = client.post(
+        "/v1/datasets/csv-bundle",
+        headers=tenant_headers(org_id, mutate=True),
+        files=files,
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    payload = uploaded.json()
+    assert payload["quality"]["rows_rejected"] == 0
+    dataset_id = payload["dataset"]["id"]
+    analyzed = client.post(
+        f"/v1/datasets/{dataset_id}/analyze",
+        headers=tenant_headers(org_id, mutate=True),
+    )
+    assert analyzed.status_code == 200, analyzed.text
+    assert analyzed.json()["opportunity_count"] == 2
+
+
+def test_csv_bundle_reports_bad_row() -> None:
+    org_id = create_tenant("Quality Diagnosticos")
+    base = Path("datasets/csv-sample")
+    bad = (
+        (base / "appointments.csv")
+        .read_text()
+        .replace(
+            "a4,rm-02,MRI_KNEE,2026-08-20T11:00:00,60,confirmed,2000",
+            "a4,rm-02,MRI_KNEE,2026-08-20T11:00:00,-1,confirmed,2000",
+        )
+        .encode()
+    )
+    files = {
+        "equipment": ("equipment.csv", (base / "equipment.csv").read_bytes(), "text/csv"),
+        "availability": (
+            "availability.csv",
+            (base / "availability.csv").read_bytes(),
+            "text/csv",
+        ),
+        "appointments": ("appointments.csv", bad, "text/csv"),
+        "executions": (
+            "executions.csv",
+            (base / "executions.csv").read_bytes(),
+            "text/csv",
+        ),
+    }
+    uploaded = client.post(
+        "/v1/datasets/csv-bundle",
+        headers=tenant_headers(org_id, mutate=True),
+        files=files,
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    quality = uploaded.json()["quality"]
+    assert quality["rows_rejected"] == 1
+    assert quality["status"] == "accepted_with_errors"
+
+
+def test_logout_revokes_session() -> None:
+    bootstrap_once()
+    isolated = TestClient(app)
+    logged_in = isolated.post(
+        "/v1/auth/login",
+        headers=APP_HEADERS,
+        json={"email": "owner@example.com", "password": "correct-horse-battery-staple"},
+    )
+    assert logged_in.status_code == 200
+    assert isolated.get("/v1/auth/me").status_code == 200
+    logged_out = isolated.post("/v1/auth/logout", headers=APP_HEADERS)
+    assert logged_out.status_code == 204
+    assert isolated.get("/v1/auth/me").status_code == 401
+
+
+def test_request_origin_is_rejected_when_not_allowed() -> None:
+    bootstrap_once()
+    response = client.post(
+        "/v1/organizations",
+        headers={**APP_HEADERS, "Origin": "https://malicious.example"},
+        json={"name": "Should Not Exist"},
+    )
+    assert response.status_code == 403
+
+
+def test_viewer_cannot_upload_dataset() -> None:
+    from pulseops_api.core.security import Role, hash_password
+    from pulseops_api.repositories.repositories import create_membership, create_user
+
+    org_id = create_tenant("RBAC Tenant")
+    with TestingSession() as db:
+        viewer = create_user(
+            db,
+            email="viewer@example.com",
+            full_name="Viewer Example",
+            password_hash=hash_password("viewer-password-123"),
+        )
+        create_membership(db, user_id=viewer.id, organization_id=org_id, role=Role.VIEWER)
+        db.commit()
+
+    viewer_client = TestClient(app)
+    login_response = viewer_client.post(
+        "/v1/auth/login",
+        headers=APP_HEADERS,
+        json={"email": "viewer@example.com", "password": "viewer-password-123"},
+    )
+    assert login_response.status_code == 200
+    sample = Path("datasets/sample/operations.json").read_bytes()
+    upload = viewer_client.post(
+        "/v1/datasets",
+        headers=tenant_headers(org_id, mutate=True),
+        files={"file": ("operations.json", sample, "application/json")},
+    )
+    assert upload.status_code == 403
+
+
+def test_owner_can_read_tenant_audit_log() -> None:
+    org_id = create_tenant("Audit Tenant")
+    sample = Path("datasets/sample/operations.json").read_bytes()
+    upload = client.post(
+        "/v1/datasets",
+        headers=tenant_headers(org_id, mutate=True),
+        files={"file": ("operations.json", sample, "application/json")},
+    )
+    assert upload.status_code == 201
+    events = client.get("/v1/audit-events", headers=tenant_headers(org_id))
+    assert events.status_code == 200
+    actions = {item["action"] for item in events.json()}
+    assert "organization.created" in actions
+    assert "dataset.uploaded" in actions
+
+
+def test_duplicate_csv_bundle_reuses_dataset() -> None:
+    org_id = create_tenant("Duplicate Dataset Tenant")
+    base = Path("datasets/csv-sample")
+
+    def files():
+        return {
+            "equipment": ("equipment.csv", (base / "equipment.csv").read_bytes(), "text/csv"),
+            "availability": ("availability.csv", (base / "availability.csv").read_bytes(), "text/csv"),
+            "appointments": ("appointments.csv", (base / "appointments.csv").read_bytes(), "text/csv"),
+            "executions": ("executions.csv", (base / "executions.csv").read_bytes(), "text/csv"),
+        }
+
+    first = client.post(
+        "/v1/datasets/csv-bundle",
+        headers=tenant_headers(org_id, mutate=True),
+        files=files(),
+    )
+    second = client.post(
+        "/v1/datasets/csv-bundle",
+        headers=tenant_headers(org_id, mutate=True),
+        files=files(),
+    )
+    assert first.status_code == 201, first.text
+    assert second.status_code == 201, second.text
+    assert first.json()["dataset"]["id"] == second.json()["dataset"]["id"]
+    assert first.json()["duplicate"] is False
+    assert second.json()["duplicate"] is True
+
+
+def test_changed_dataset_updates_logical_opportunities_without_duplicates() -> None:
+    org_id = create_tenant("Opportunity Upsert Tenant")
+    base = Path("datasets/csv-sample")
+
+    def upload(appointments_bytes: bytes):
+        return client.post(
+            "/v1/datasets/csv-bundle",
+            headers=tenant_headers(org_id, mutate=True),
+            files={
+                "equipment": ("equipment.csv", (base / "equipment.csv").read_bytes(), "text/csv"),
+                "availability": ("availability.csv", (base / "availability.csv").read_bytes(), "text/csv"),
+                "appointments": ("appointments.csv", appointments_bytes, "text/csv"),
+                "executions": ("executions.csv", (base / "executions.csv").read_bytes(), "text/csv"),
+            },
+        )
+
+    original = (base / "appointments.csv").read_bytes()
+    first = upload(original)
+    first_id = first.json()["dataset"]["id"]
+    assert client.post(
+        f"/v1/datasets/{first_id}/analyze",
+        headers=tenant_headers(org_id, mutate=True),
+    ).status_code == 200
+
+    changed = original.decode().replace(
+        "a2,rm-02,MRI_BRAIN,2026-08-20T09:00:00,60,cancelled,3000",
+        "a2,rm-02,MRI_BRAIN,2026-08-20T09:00:00,60,cancelled,3200",
+    ).encode()
+    second = upload(changed)
+    second_id = second.json()["dataset"]["id"]
+    assert second_id != first_id
+    assert client.post(
+        f"/v1/datasets/{second_id}/analyze",
+        headers=tenant_headers(org_id, mutate=True),
+    ).status_code == 200
+
+    listed = client.get("/v1/opportunities", headers=tenant_headers(org_id))
+    assert listed.status_code == 200
+    assert len(listed.json()) == 2
+    cancellation = next(item for item in listed.json() if item["category"] == "cancellation")
+    assert cancellation["estimated_gain"] == 6200.0
+
+
+def test_opportunity_history_tracks_snapshots_and_temporal_metrics() -> None:
+    org_id = create_tenant("Opportunity History Tenant")
+    base = Path("datasets/csv-sample")
+
+    def upload(appointments_bytes: bytes):
+        return client.post(
+            "/v1/datasets/csv-bundle",
+            headers=tenant_headers(org_id, mutate=True),
+            files={
+                "equipment": ("equipment.csv", (base / "equipment.csv").read_bytes(), "text/csv"),
+                "availability": ("availability.csv", (base / "availability.csv").read_bytes(), "text/csv"),
+                "appointments": ("appointments.csv", appointments_bytes, "text/csv"),
+                "executions": ("executions.csv", (base / "executions.csv").read_bytes(), "text/csv"),
+            },
+        )
+
+    original = (base / "appointments.csv").read_bytes()
+    first = upload(original)
+    first_id = first.json()["dataset"]["id"]
+    assert client.post(
+        f"/v1/datasets/{first_id}/analyze",
+        headers=tenant_headers(org_id, mutate=True),
+    ).status_code == 200
+
+    changed = original.decode().replace(
+        "a2,rm-02,MRI_BRAIN,2026-08-20T09:00:00,60,cancelled,3000",
+        "a2,rm-02,MRI_BRAIN,2026-08-20T09:00:00,60,cancelled,4200",
+    ).encode()
+    second = upload(changed)
+    second_id = second.json()["dataset"]["id"]
+    assert client.post(
+        f"/v1/datasets/{second_id}/analyze",
+        headers=tenant_headers(org_id, mutate=True),
+    ).status_code == 200
+
+    opportunities = client.get(
+        "/v1/opportunities?status=open", headers=tenant_headers(org_id)
+    ).json()
+    cancellation = next(item for item in opportunities if item["category"] == "cancellation")
+    history = client.get(
+        f"/v1/opportunities/{cancellation['id']}/history",
+        headers=tenant_headers(org_id),
+    )
+    assert history.status_code == 200, history.text
+    payload = history.json()
+    assert payload["snapshot_count"] == 2
+    assert len(payload["series"]) == 2
+    assert payload["series"][0]["dataset_id"] == first_id
+    assert payload["series"][1]["dataset_id"] == second_id
+    lost_revenue = next(metric for metric in payload["metrics"] if metric["key"] == "lost_revenue")
+    assert lost_revenue["current"] > lost_revenue["initial"]
+    assert lost_revenue["trend"] == "worsening"
+    assert payload["trend"] in {"stable", "worsening"}
+
+
+def test_opportunity_temporal_consolidates_equipment_series() -> None:
+    org_id = create_tenant("Temporal Consolidation Tenant")
+    base = Path("datasets/csv-sample")
+
+    def upload(appointments_bytes: bytes):
+        response = client.post(
+            "/v1/datasets/csv-bundle",
+            headers=tenant_headers(org_id, mutate=True),
+            files={
+                "equipment": ("equipment.csv", (base / "equipment.csv").read_bytes(), "text/csv"),
+                "availability": ("availability.csv", (base / "availability.csv").read_bytes(), "text/csv"),
+                "appointments": ("appointments.csv", appointments_bytes, "text/csv"),
+                "executions": ("executions.csv", (base / "executions.csv").read_bytes(), "text/csv"),
+            },
+        )
+        assert response.status_code == 201, response.text
+        return response.json()["dataset"]["id"]
+
+    original = (base / "appointments.csv").read_bytes()
+    first_id = upload(original)
+    assert client.post(
+        f"/v1/datasets/{first_id}/analyze",
+        headers=tenant_headers(org_id, mutate=True),
+    ).status_code == 200
+
+    changed = original.decode().replace(
+        "a2,rm-02,MRI_BRAIN,2026-08-20T09:00:00,60,cancelled,3000",
+        "a2,rm-02,MRI_BRAIN,2026-08-20T09:00:00,60,cancelled,4200",
+    ).encode()
+    second_id = upload(changed)
+    assert client.post(
+        f"/v1/datasets/{second_id}/analyze",
+        headers=tenant_headers(org_id, mutate=True),
+    ).status_code == 200
+
+    response = client.get(
+        "/v1/opportunities/temporal",
+        headers=tenant_headers(org_id),
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["equipment_count"] >= 1
+    assert payload["series_count"] >= 2
+    rm02 = next(item for item in payload["equipments"] if item["equipment_id"] == "rm-02")
+    cancellation = next(item for item in rm02["series"] if item["category"] == "cancellation")
+    assert cancellation["snapshot_count"] == 2
+    assert len(cancellation["series"]) == 2
+    assert cancellation["series"][0]["dataset_id"] == first_id
+    assert cancellation["series"][1]["dataset_id"] == second_id
+    assert cancellation["trend"] in {"improving", "worsening", "stable"}
+
+
+def test_opportunity_history_is_tenant_isolated() -> None:
+    org_a = create_tenant("History Tenant A")
+    org_b = create_tenant("History Tenant B")
+    sample = Path("datasets/sample/operations.json").read_bytes()
+    uploaded = client.post(
+        "/v1/datasets",
+        headers=tenant_headers(org_a, mutate=True),
+        files={"file": ("operations.json", sample, "application/json")},
+    )
+    dataset_id = uploaded.json()["id"]
+    client.post(
+        f"/v1/datasets/{dataset_id}/analyze",
+        headers=tenant_headers(org_a, mutate=True),
+    )
+    opportunity_id = client.get(
+        "/v1/opportunities", headers=tenant_headers(org_a)
+    ).json()[0]["id"]
+    hidden = client.get(
+        f"/v1/opportunities/{opportunity_id}/history",
+        headers=tenant_headers(org_b),
+    )
+    assert hidden.status_code == 404
+
+
+def test_no_show_ml_train_and_predict() -> None:
+    org_id = create_tenant("ML Tenant")
+    base = Path("datasets/no-show-demo")
+    uploaded = client.post(
+        "/v1/datasets/csv-bundle",
+        headers=tenant_headers(org_id, mutate=True),
+        files={
+            "equipment": ("equipment.csv", (base / "equipment.csv").read_bytes(), "text/csv"),
+            "availability": ("availability.csv", (base / "availability.csv").read_bytes(), "text/csv"),
+            "appointments": ("appointments.csv", (base / "appointments.csv").read_bytes(), "text/csv"),
+            "executions": ("executions.csv", (base / "executions.csv").read_bytes(), "text/csv"),
+        },
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    dataset_id = uploaded.json()["dataset"]["id"]
+    trained = client.post(
+        f"/v1/ml/no-show/train/{dataset_id}",
+        headers=tenant_headers(org_id, mutate=True),
+    )
+    assert trained.status_code == 200, trained.text
+    payload = trained.json()
+    assert payload["prediction_count"] == 28
+    assert payload["actionable_count"] > 0
+    assert payload["model_run"]["training_rows"] >= 200
+    assert payload["model_run"]["metrics"]["selected_ranking"]["roc_auc"] > 0.5
+
+    predictions = client.get(
+        "/v1/ml/no-show/predictions", headers=tenant_headers(org_id)
+    )
+    assert predictions.status_code == 200
+    assert len(predictions.json()) == 28
+
+
+def _train_no_show_for_tenant(org_id: str) -> list[dict[str, object]]:
+    base = Path("datasets/no-show-demo")
+    uploaded = client.post(
+        "/v1/datasets/csv-bundle",
+        headers=tenant_headers(org_id, mutate=True),
+        files={
+            "equipment": ("equipment.csv", (base / "equipment.csv").read_bytes(), "text/csv"),
+            "availability": ("availability.csv", (base / "availability.csv").read_bytes(), "text/csv"),
+            "appointments": ("appointments.csv", (base / "appointments.csv").read_bytes(), "text/csv"),
+            "executions": ("executions.csv", (base / "executions.csv").read_bytes(), "text/csv"),
+        },
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    dataset_id = uploaded.json()["dataset"]["id"]
+    trained = client.post(
+        f"/v1/ml/no-show/train/{dataset_id}",
+        headers=tenant_headers(org_id, mutate=True),
+    )
+    assert trained.status_code == 200, trained.text
+    return trained.json()["predictions"]
+
+
+def test_no_show_decision_is_persisted_and_idempotently_updated() -> None:
+    org_id = create_tenant("Prediction Decision Tenant")
+    predictions = _train_no_show_for_tenant(org_id)
+    actionable = next(item for item in predictions if item["action_recommended"])
+
+    first = client.post(
+        f"/v1/ml/no-show/predictions/{actionable['id']}/decision",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"decision": "accepted", "note": "Recepção fará contato."},
+    )
+    assert first.status_code == 200, first.text
+    first_id = first.json()["id"]
+
+    second = client.post(
+        f"/v1/ml/no-show/predictions/{actionable['id']}/decision",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"decision": "dismissed", "note": "Paciente já confirmou por outro canal."},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["id"] == first_id
+    assert second.json()["decision"] == "dismissed"
+
+    listed = client.get(
+        "/v1/ml/no-show/predictions", headers=tenant_headers(org_id)
+    )
+    matching = next(item for item in listed.json() if item["id"] == actionable["id"])
+    assert matching["decision"]["decision"] == "dismissed"
+    assert matching["recommended_action_label"]
+    assert matching["evidence"]["explanation"]["factors"]
+
+
+def test_no_show_decision_is_tenant_isolated() -> None:
+    org_a = create_tenant("Prediction Tenant A")
+    org_b = create_tenant("Prediction Tenant B")
+    predictions = _train_no_show_for_tenant(org_a)
+    actionable = next(item for item in predictions if item["action_recommended"])
+
+    forbidden = client.post(
+        f"/v1/ml/no-show/predictions/{actionable['id']}/decision",
+        headers=tenant_headers(org_b, mutate=True),
+        json={"decision": "accepted"},
+    )
+    assert forbidden.status_code == 404
+
+
+def test_no_show_outcome_requires_accepted_decision() -> None:
+    org_id = create_tenant("Measure Tenant")
+    from pulseops_api.models.db_models import NoShowPrediction, ModelRun, Dataset
+    from datetime import datetime, timezone, timedelta
+    with TestingSession() as db:
+        dataset = Dataset(organization_id=org_id, filename="x", status="validated", content_sha256="m"*64, raw_payload="{}")
+        db.add(dataset); db.flush()
+        run = ModelRun(organization_id=org_id, dataset_id=dataset.id, model_name="no-show-risk", selected_model_version="v", feature_set_version="f", training_rows=1, calibration_rows=1, validation_rows=1, metrics={})
+        db.add(run); db.flush()
+        pred = NoShowPrediction(organization_id=org_id, dataset_id=dataset.id, model_run_id=run.id, appointment_id="a", equipment_id="rm", scheduled_at=datetime.now(timezone.utc)+timedelta(days=1), probability=.5, expected_revenue=1000, expected_loss=500, expected_recovered_revenue=300, expected_net_value=290, action_recommended=True, recommended_action_type="request_confirmation", recommended_action_label="Solicitar confirmação", recommendation_reason="x", risk_level="moderate", model_version="v", feature_set_version="f", evidence={})
+        db.add(pred); db.commit(); pid=pred.id
+    response = client.put(f"/v1/ml/no-show/predictions/{pid}/outcome", headers=tenant_headers(org_id, mutate=True), json={"intervention_executed": True})
+    assert response.status_code == 422
+
+
+def test_no_show_outcome_execution_is_persisted_after_acceptance() -> None:
+    org_id = create_tenant("Measure Accepted Tenant")
+    from pulseops_api.models.db_models import NoShowPrediction, ModelRun, Dataset
+    from datetime import datetime, timezone, timedelta
+    with TestingSession() as db:
+        dataset = Dataset(organization_id=org_id, filename="y", status="validated", content_sha256="n"*64, raw_payload="{}")
+        db.add(dataset); db.flush()
+        run = ModelRun(organization_id=org_id, dataset_id=dataset.id, model_name="no-show-risk", selected_model_version="v", feature_set_version="f", training_rows=1, calibration_rows=1, validation_rows=1, metrics={})
+        db.add(run); db.flush()
+        pred = NoShowPrediction(organization_id=org_id, dataset_id=dataset.id, model_run_id=run.id, appointment_id="b", equipment_id="rm", scheduled_at=datetime.now(timezone.utc)+timedelta(days=1), probability=.5, expected_revenue=1000, expected_loss=500, expected_recovered_revenue=300, expected_net_value=290, action_recommended=True, recommended_action_type="request_confirmation", recommended_action_label="Solicitar confirmação", recommendation_reason="x", risk_level="moderate", model_version="v", feature_set_version="f", evidence={})
+        db.add(pred); db.commit(); pid=pred.id
+    accepted = client.post(f"/v1/ml/no-show/predictions/{pid}/decision", headers=tenant_headers(org_id, mutate=True), json={"decision":"accepted"})
+    assert accepted.status_code == 200
+    executed = client.put(
+        f"/v1/ml/no-show/predictions/{pid}/intervention",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"channel": "whatsapp", "contact_result": "confirmed", "note": "Contato realizado"},
+    )
+    assert executed.status_code == 200, executed.text
+    assert executed.json()["channel"] == "whatsapp"
+    assert executed.json()["contact_result"] == "confirmed"
+    listed = client.get("/v1/ml/no-show/predictions", headers=tenant_headers(org_id))
+    item = next(x for x in listed.json() if x["id"] == pid)
+    assert item["intervention"]["contact_result"] == "confirmed"
+    assert item["outcome"]["intervention_executed"] is True
+
+
+def test_no_show_prediction_queue_only_returns_latest_model_run() -> None:
+    org_id = create_tenant("Current Prediction Queue Tenant")
+    from datetime import datetime, timedelta, timezone
+    from pulseops_api.models.db_models import Dataset, ModelRun, NoShowPrediction
+
+    with TestingSession() as db:
+        dataset = Dataset(
+            organization_id=org_id,
+            filename="queue-history",
+            status="validated",
+            content_sha256="q" * 64,
+            raw_payload="{}",
+        )
+        db.add(dataset)
+        db.flush()
+
+        older_run = ModelRun(
+            organization_id=org_id,
+            dataset_id=dataset.id,
+            model_name="no-show-risk",
+            selected_model_version="old-v1",
+            feature_set_version="f1",
+            training_rows=1,
+            calibration_rows=1,
+            validation_rows=1,
+            metrics={},
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+        db.add(older_run)
+        db.flush()
+        older = NoShowPrediction(
+            organization_id=org_id,
+            dataset_id=dataset.id,
+            model_run_id=older_run.id,
+            appointment_id="same-appointment",
+            equipment_id="rm-01",
+            scheduled_at=datetime.now(timezone.utc) + timedelta(days=2),
+            probability=0.20,
+            expected_revenue=1000,
+            expected_loss=200,
+            expected_recovered_revenue=100,
+            expected_net_value=90,
+            action_recommended=False,
+            recommended_action_type="no_action",
+            recommended_action_label="Apenas monitorar",
+            recommendation_reason="old",
+            risk_level="low",
+            model_version="old-v1",
+            feature_set_version="f1",
+            evidence={},
+        )
+        db.add(older)
+
+        current_run = ModelRun(
+            organization_id=org_id,
+            dataset_id=dataset.id,
+            model_name="no-show-risk",
+            selected_model_version="current-v2",
+            feature_set_version="f1",
+            training_rows=1,
+            calibration_rows=1,
+            validation_rows=1,
+            metrics={},
+            created_at=datetime.now(timezone.utc),
+        )
+        db.add(current_run)
+        db.flush()
+        current = NoShowPrediction(
+            organization_id=org_id,
+            dataset_id=dataset.id,
+            model_run_id=current_run.id,
+            appointment_id="same-appointment",
+            equipment_id="rm-01",
+            scheduled_at=datetime.now(timezone.utc) + timedelta(days=2),
+            probability=0.60,
+            expected_revenue=1000,
+            expected_loss=600,
+            expected_recovered_revenue=390,
+            expected_net_value=380,
+            action_recommended=True,
+            recommended_action_type="active_confirmation",
+            recommended_action_label="Realizar confirmação ativa",
+            recommendation_reason="current",
+            risk_level="high",
+            model_version="current-v2",
+            feature_set_version="f1",
+            evidence={},
+        )
+        db.add(current)
+        db.commit()
+        current_id = current.id
+
+    response = client.get(
+        "/v1/ml/no-show/predictions", headers=tenant_headers(org_id)
+    )
+    assert response.status_code == 200, response.text
+    items = response.json()
+    matching = [item for item in items if item["appointment_id"] == "same-appointment"]
+    assert len(matching) == 1
+    assert matching[0]["id"] == current_id
+    assert matching[0]["model_version"] == "current-v2"
+
+
+def test_no_show_measure_state_cannot_revert_execution() -> None:
+    org_id = create_tenant("Measure State Tenant")
+    from datetime import datetime, timedelta, timezone
+    from pulseops_api.models.db_models import Dataset, ModelRun, NoShowPrediction
+
+    with TestingSession() as db:
+        dataset = Dataset(
+            organization_id=org_id,
+            filename="measure-state",
+            status="validated",
+            content_sha256="r" * 64,
+            raw_payload="{}",
+        )
+        db.add(dataset)
+        db.flush()
+        run = ModelRun(
+            organization_id=org_id,
+            dataset_id=dataset.id,
+            model_name="no-show-risk",
+            selected_model_version="v",
+            feature_set_version="f",
+            training_rows=1,
+            calibration_rows=1,
+            validation_rows=1,
+            metrics={},
+        )
+        db.add(run)
+        db.flush()
+        pred = NoShowPrediction(
+            organization_id=org_id,
+            dataset_id=dataset.id,
+            model_run_id=run.id,
+            appointment_id="measure-state-appointment",
+            equipment_id="rm",
+            scheduled_at=datetime.now(timezone.utc) - timedelta(hours=1),
+            probability=0.5,
+            expected_revenue=1000,
+            expected_loss=500,
+            expected_recovered_revenue=300,
+            expected_net_value=290,
+            action_recommended=True,
+            recommended_action_type="request_confirmation",
+            recommended_action_label="Solicitar confirmação",
+            recommendation_reason="x",
+            risk_level="moderate",
+            model_version="v",
+            feature_set_version="f",
+            evidence={},
+        )
+        db.add(pred)
+        db.commit()
+        pid = pred.id
+
+    accepted = client.post(
+        f"/v1/ml/no-show/predictions/{pid}/decision",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"decision": "accepted"},
+    )
+    assert accepted.status_code == 200, accepted.text
+
+    executed = client.put(
+        f"/v1/ml/no-show/predictions/{pid}/intervention",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"channel": "phone", "contact_result": "confirmed"},
+    )
+    assert executed.status_code == 200, executed.text
+
+    reverted = client.put(
+        f"/v1/ml/no-show/predictions/{pid}/outcome",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"intervention_executed": False},
+    )
+    assert reverted.status_code == 422
+
+
+def test_no_show_measure_requires_observed_status_for_financial_outcome() -> None:
+    org_id = create_tenant("Measure Financial Tenant")
+    from datetime import datetime, timedelta, timezone
+    from pulseops_api.models.db_models import Dataset, ModelRun, NoShowPrediction
+
+    with TestingSession() as db:
+        dataset = Dataset(
+            organization_id=org_id,
+            filename="measure-financial",
+            status="validated",
+            content_sha256="s" * 64,
+            raw_payload="{}",
+        )
+        db.add(dataset)
+        db.flush()
+        run = ModelRun(
+            organization_id=org_id,
+            dataset_id=dataset.id,
+            model_name="no-show-risk",
+            selected_model_version="v",
+            feature_set_version="f",
+            training_rows=1,
+            calibration_rows=1,
+            validation_rows=1,
+            metrics={},
+        )
+        db.add(run)
+        db.flush()
+        pred = NoShowPrediction(
+            organization_id=org_id,
+            dataset_id=dataset.id,
+            model_run_id=run.id,
+            appointment_id="measure-financial-appointment",
+            equipment_id="rm",
+            scheduled_at=datetime.now(timezone.utc) - timedelta(hours=1),
+            probability=0.5,
+            expected_revenue=1000,
+            expected_loss=500,
+            expected_recovered_revenue=300,
+            expected_net_value=290,
+            action_recommended=True,
+            recommended_action_type="request_confirmation",
+            recommended_action_label="Solicitar confirmação",
+            recommendation_reason="x",
+            risk_level="moderate",
+            model_version="v",
+            feature_set_version="f",
+            evidence={},
+        )
+        db.add(pred)
+        db.commit()
+        pid = pred.id
+
+    accepted = client.post(
+        f"/v1/ml/no-show/predictions/{pid}/decision",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"decision": "accepted"},
+    )
+    assert accepted.status_code == 200, accepted.text
+
+    executed = client.put(
+        f"/v1/ml/no-show/predictions/{pid}/intervention",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"channel": "whatsapp", "contact_result": "confirmed"},
+    )
+    assert executed.status_code == 200, executed.text
+
+    invalid = client.put(
+        f"/v1/ml/no-show/predictions/{pid}/outcome",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"intervention_executed": True, "realized_revenue": 1000},
+    )
+    assert invalid.status_code == 422
+
+    measured = client.put(
+        f"/v1/ml/no-show/predictions/{pid}/outcome",
+        headers=tenant_headers(org_id, mutate=True),
+        json={
+            "intervention_executed": True,
+            "observed_status": "attended",
+            "realized_revenue": 1000,
+            "measured_recovered_value": 290,
+        },
+    )
+    assert measured.status_code == 200, measured.text
+    assert measured.json()["observed_status"] == "attended"
+
+
+def test_no_show_intervention_requires_accepted_recommendation() -> None:
+    org_id = create_tenant("Intervention Requires Accepted")
+    predictions = _train_no_show_for_tenant(org_id)
+    actionable = next(item for item in predictions if item["action_recommended"])
+
+    response = client.put(
+        f"/v1/ml/no-show/predictions/{actionable['id']}/intervention",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"channel": "whatsapp", "contact_result": "confirmed"},
+    )
+    assert response.status_code == 422
+
+
+def test_no_show_intervention_is_idempotently_updated_and_tenant_isolated() -> None:
+    org_a = create_tenant("Intervention Tenant A")
+    org_b = create_tenant("Intervention Tenant B")
+    predictions = _train_no_show_for_tenant(org_a)
+    actionable = next(item for item in predictions if item["action_recommended"])
+
+    accepted = client.post(
+        f"/v1/ml/no-show/predictions/{actionable['id']}/decision",
+        headers=tenant_headers(org_a, mutate=True),
+        json={"decision": "accepted"},
+    )
+    assert accepted.status_code == 200, accepted.text
+
+    first = client.put(
+        f"/v1/ml/no-show/predictions/{actionable['id']}/intervention",
+        headers=tenant_headers(org_a, mutate=True),
+        json={"channel": "whatsapp", "contact_result": "no_response", "note": "Primeira tentativa"},
+    )
+    assert first.status_code == 200, first.text
+    first_id = first.json()["id"]
+
+    second = client.put(
+        f"/v1/ml/no-show/predictions/{actionable['id']}/intervention",
+        headers=tenant_headers(org_a, mutate=True),
+        json={"channel": "phone", "contact_result": "confirmed", "note": "Confirmou por telefone"},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["id"] == first_id
+    assert second.json()["channel"] == "phone"
+    assert second.json()["contact_result"] == "confirmed"
+
+    forbidden = client.put(
+        f"/v1/ml/no-show/predictions/{actionable['id']}/intervention",
+        headers=tenant_headers(org_b, mutate=True),
+        json={"channel": "phone", "contact_result": "confirmed"},
+    )
+    assert forbidden.status_code == 404
+
+    listed = client.get("/v1/ml/no-show/predictions", headers=tenant_headers(org_a))
+    item = next(x for x in listed.json() if x["id"] == actionable["id"])
+    assert item["intervention"]["channel"] == "phone"
+    assert item["intervention"]["contact_result"] == "confirmed"
+
+    summary = client.get("/v1/ml/no-show/measure-summary", headers=tenant_headers(org_a))
+    assert summary.status_code == 200
+    assert summary.json()["executed_actions"] >= 1
+
+
+def test_opportunity_decision_is_separate_from_measurement() -> None:
+    org_id = create_tenant("Opportunity Decision Tenant")
+    sample = Path("datasets/sample/operations.json").read_bytes()
+    upload = client.post(
+        "/v1/datasets",
+        headers=tenant_headers(org_id, mutate=True),
+        files={"file": ("operations.json", sample, "application/json")},
+    )
+    assert upload.status_code == 201, upload.text
+    dataset_id = upload.json()["id"]
+    analyzed = client.post(
+        f"/v1/datasets/{dataset_id}/analyze",
+        headers=tenant_headers(org_id, mutate=True),
+    )
+    assert analyzed.status_code == 200, analyzed.text
+
+    open_items = client.get(
+        "/v1/opportunities?status=open", headers=tenant_headers(org_id)
+    )
+    assert open_items.status_code == 200, open_items.text
+    opportunity_id = open_items.json()[0]["id"]
+
+    accepted = client.post(
+        f"/v1/opportunities/{opportunity_id}/decision",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"decision": "accepted", "notes": "Executar piloto por quatro semanas."},
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["status"] == "accepted"
+    assert accepted.json()["decision_note"] == "Executar piloto por quatro semanas."
+    assert accepted.json()["decided_at"] is not None
+
+    open_after = client.get(
+        "/v1/opportunities?status=open", headers=tenant_headers(org_id)
+    ).json()
+    assert all(item["id"] != opportunity_id for item in open_after)
+    tracking = client.get(
+        "/v1/opportunities?status=accepted", headers=tenant_headers(org_id)
+    )
+    assert tracking.status_code == 200
+    assert any(item["id"] == opportunity_id for item in tracking.json())
+
+    detail = client.get(
+        f"/v1/opportunities/{opportunity_id}", headers=tenant_headers(org_id)
+    )
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "accepted"
+
+    measured = client.post(
+        f"/v1/opportunities/{opportunity_id}/outcome",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"measured_gain": 1234.5, "notes": "Ganho observado no piloto."},
+    )
+    assert measured.status_code == 201, measured.text
+    detail_after = client.get(
+        f"/v1/opportunities/{opportunity_id}", headers=tenant_headers(org_id)
+    )
+    assert detail_after.json()["status"] == "measured"
+
+
+def test_dismissed_opportunity_cannot_be_measured() -> None:
+    org_id = create_tenant("Dismissed Opportunity Tenant")
+    sample = Path("datasets/sample/operations.json").read_bytes()
+    upload = client.post(
+        "/v1/datasets",
+        headers=tenant_headers(org_id, mutate=True),
+        files={"file": ("operations.json", sample, "application/json")},
+    )
+    dataset_id = upload.json()["id"]
+    client.post(
+        f"/v1/datasets/{dataset_id}/analyze",
+        headers=tenant_headers(org_id, mutate=True),
+    )
+    opportunity_id = client.get(
+        "/v1/opportunities?status=open", headers=tenant_headers(org_id)
+    ).json()[0]["id"]
+    dismissed = client.post(
+        f"/v1/opportunities/{opportunity_id}/decision",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"decision": "dismissed", "notes": "Fora de escopo neste ciclo."},
+    )
+    assert dismissed.status_code == 200
+    assert dismissed.json()["status"] == "dismissed"
+    outcome = client.post(
+        f"/v1/opportunities/{opportunity_id}/outcome",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"measured_gain": 10},
+    )
+    assert outcome.status_code == 422
+
+
+def test_opportunity_analytics_tracks_decisions_and_measured_gain() -> None:
+    org_id = create_tenant("Opportunity Analytics Tenant")
+    sample = Path("datasets/sample/operations.json").read_bytes()
+    upload = client.post(
+        "/v1/datasets",
+        headers=tenant_headers(org_id, mutate=True),
+        files={"file": ("operations.json", sample, "application/json")},
+    )
+    dataset_id = upload.json()["id"]
+    analyzed = client.post(
+        f"/v1/datasets/{dataset_id}/analyze",
+        headers=tenant_headers(org_id, mutate=True),
+    )
+    assert analyzed.status_code == 200
+    opportunities = client.get(
+        "/v1/opportunities?status=open", headers=tenant_headers(org_id)
+    ).json()
+    assert len(opportunities) >= 2
+
+    measured_id = opportunities[0]["id"]
+    dismissed_id = opportunities[1]["id"]
+    accepted = client.post(
+        f"/v1/opportunities/{measured_id}/decision",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"decision": "accepted"},
+    )
+    assert accepted.status_code == 200
+    outcome = client.post(
+        f"/v1/opportunities/{measured_id}/outcome",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"measured_gain": 500.0, "notes": "Resultado validado."},
+    )
+    assert outcome.status_code == 201
+    dismissed = client.post(
+        f"/v1/opportunities/{dismissed_id}/decision",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"decision": "dismissed"},
+    )
+    assert dismissed.status_code == 200
+
+    analytics = client.get(
+        "/v1/opportunities/analytics", headers=tenant_headers(org_id)
+    )
+    assert analytics.status_code == 200, analytics.text
+    payload = analytics.json()
+    assert payload["measured_opportunities"] == 1
+    assert payload["dismissed_opportunities"] == 1
+    assert payload["measured_gain"] == 500.0
+    assert payload["successful_opportunities"] == 1
+    assert payload["adoption_rate"] == 0.5
+    assert payload["success_rate"] == 1.0
+    assert payload["by_category"]
+    assert payload["by_equipment"]
+
+    measured = client.get(
+        "/v1/opportunities?status=measured", headers=tenant_headers(org_id)
+    )
+    assert measured.status_code == 200
+    item = next(item for item in measured.json() if item["id"] == measured_id)
+    assert item["measured_gain"] == 500.0
+    assert item["outcome_notes"] == "Resultado validado."
+    assert item["outcome_recorded_at"] is not None
+
+
+def test_opportunity_decision_impact_links_decision_future_snapshot_and_outcome() -> None:
+    org_id = create_tenant("Decision Impact Tenant")
+    base = Path("datasets/csv-sample")
+
+    def upload(appointments_bytes: bytes) -> str:
+        response = client.post(
+            "/v1/datasets/csv-bundle",
+            headers=tenant_headers(org_id, mutate=True),
+            files={
+                "equipment": ("equipment.csv", (base / "equipment.csv").read_bytes(), "text/csv"),
+                "availability": ("availability.csv", (base / "availability.csv").read_bytes(), "text/csv"),
+                "appointments": ("appointments.csv", appointments_bytes, "text/csv"),
+                "executions": ("executions.csv", (base / "executions.csv").read_bytes(), "text/csv"),
+            },
+        )
+        assert response.status_code == 201, response.text
+        return response.json()["dataset"]["id"]
+
+    original = (base / "appointments.csv").read_bytes()
+    first_id = upload(original)
+    assert client.post(
+        f"/v1/datasets/{first_id}/analyze",
+        headers=tenant_headers(org_id, mutate=True),
+    ).status_code == 200
+
+    opportunities = client.get(
+        "/v1/opportunities?status=open", headers=tenant_headers(org_id)
+    ).json()
+    cancellation = next(item for item in opportunities if item["category"] == "cancellation")
+
+    decision = client.post(
+        f"/v1/opportunities/{cancellation['id']}/decision",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"decision": "accepted", "notes": "Pilot intervention"},
+    )
+    assert decision.status_code == 200, decision.text
+
+    before = client.get(
+        f"/v1/opportunities/{cancellation['id']}/history",
+        headers=tenant_headers(org_id),
+    ).json()["decision_impact"]
+    assert before["state"] == "awaiting_post_decision_data"
+    assert before["snapshots_before_decision"] == 1
+    assert before["snapshots_after_decision"] == 0
+    assert before["decision_note"] == "Pilot intervention"
+
+    changed = original.decode().replace(
+        "a2,rm-02,MRI_BRAIN,2026-08-20T09:00:00,60,cancelled,3000",
+        "a2,rm-02,MRI_BRAIN,2026-08-20T09:00:00,60,cancelled,4200",
+    ).encode()
+    second_id = upload(changed)
+    assert client.post(
+        f"/v1/datasets/{second_id}/analyze",
+        headers=tenant_headers(org_id, mutate=True),
+    ).status_code == 200
+
+    after_payload = client.get(
+        f"/v1/opportunities/{cancellation['id']}/history",
+        headers=tenant_headers(org_id),
+    ).json()["decision_impact"]
+    assert after_payload["state"] == "post_decision_observed"
+    assert after_payload["snapshots_after_decision"] == 1
+    assert after_payload["baseline_before_decision"] is not None
+    assert after_payload["current_after_decision"] is not None
+
+    measured = client.post(
+        f"/v1/opportunities/{cancellation['id']}/outcome",
+        headers=tenant_headers(org_id, mutate=True),
+        json={"measured_gain": 500.0, "notes": "Observed pilot result"},
+    )
+    assert measured.status_code == 201, measured.text
+
+    final = client.get(
+        f"/v1/opportunities/{cancellation['id']}/history",
+        headers=tenant_headers(org_id),
+    ).json()["decision_impact"]
+    assert final["measured_gain"] == 500.0
+    assert final["outcome_notes"] == "Observed pilot result"
+    assert final["potential_at_outcome"] is not None
+    assert final["realization_rate"] is not None
+
+
+def test_executive_summary_is_tenant_scoped_and_composes_existing_metrics() -> None:
+    org_id = create_tenant("Executive Diagnosticos")
+    base = Path("datasets/csv-sample")
+    files = {
+        "equipment": ("equipment.csv", (base / "equipment.csv").read_bytes(), "text/csv"),
+        "availability": ("availability.csv", (base / "availability.csv").read_bytes(), "text/csv"),
+        "appointments": ("appointments.csv", (base / "appointments.csv").read_bytes(), "text/csv"),
+        "executions": ("executions.csv", (base / "executions.csv").read_bytes(), "text/csv"),
+    }
+    uploaded = client.post(
+        "/v1/datasets/csv-bundle", headers=tenant_headers(org_id, mutate=True), files=files
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    dataset_id = uploaded.json()["dataset"]["id"]
+    analyzed = client.post(
+        f"/v1/datasets/{dataset_id}/analyze", headers=tenant_headers(org_id, mutate=True)
+    )
+    assert analyzed.status_code == 200, analyzed.text
+
+    summary = client.get("/v1/executive/summary", headers=tenant_headers(org_id))
+    assert summary.status_code == 200, summary.text
+    payload = summary.json()
+    assert payload["opportunities"]["open"] == 2
+    assert payload["opportunities"]["potential_identified"] > 0
+    assert payload["equipments"]
+    assert {item["equipment_id"] for item in payload["equipments"]} == {"rm-02"}
+    assert payload["latest_dataset_status"] == "analyzed"
+    assert payload["decisions"]["observed_after_decision"] == 0
+    assert payload["no_show"]["measured_outcomes"] == 0
+
+
+def test_executive_summary_exposes_period_comparison_after_second_dataset() -> None:
+    org_id = create_tenant("Executive Temporal Diagnosticos")
+    base = Path("datasets/csv-sample")
+
+    def bundle(*, equipment_bytes: bytes):
+        return {
+            "equipment": ("equipment.csv", equipment_bytes, "text/csv"),
+            "availability": ("availability.csv", (base / "availability.csv").read_bytes(), "text/csv"),
+            "appointments": ("appointments.csv", (base / "appointments.csv").read_bytes(), "text/csv"),
+            "executions": ("executions.csv", (base / "executions.csv").read_bytes(), "text/csv"),
+        }
+
+    original_equipment = (base / "equipment.csv").read_bytes()
+    for files in (
+        bundle(equipment_bytes=original_equipment),
+        bundle(equipment_bytes=original_equipment.replace(b"RM-02", b"RM-02 ", 1)),
+    ):
+        uploaded = client.post(
+            "/v1/datasets/csv-bundle",
+            headers=tenant_headers(org_id, mutate=True),
+            files=files,
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        dataset_id = uploaded.json()["dataset"]["id"]
+        analyzed = client.post(
+            f"/v1/datasets/{dataset_id}/analyze",
+            headers=tenant_headers(org_id, mutate=True),
+        )
+        assert analyzed.status_code == 200, analyzed.text
+
+    summary = client.get("/v1/executive/summary", headers=tenant_headers(org_id))
+    assert summary.status_code == 200, summary.text
+    payload = summary.json()
+    assert payload["previous_period_at"] is not None
+    assert payload["comparisons"]
+    assert payload["comparisons"][0]["key"] == "operational_potential"
+    assert {item["trend"] for item in payload["comparisons"]} <= {
+        "improving",
+        "worsening",
+        "stable",
+        "insufficient_data",
+    }
+    assert "decision_rows" in payload

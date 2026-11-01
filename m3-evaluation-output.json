@@ -1,0 +1,34 @@
+{
+  "dataset_notice": "Synthetic dataset; metrics validate engineering only.",
+  "training_samples": 135,
+  "validation_samples": 45,
+  "champion": {
+    "brier_score": 0.19557890778522,
+    "log_loss": 0.5799748772582686,
+    "calibration_error": 4.9333382666716386e-05,
+    "positive_rate": 0.26666666666666666,
+    "sample_size": 45
+  },
+  "challenger": {
+    "brier_score": 0.0023131640616037355,
+    "log_loss": 0.04635392517468796,
+    "calibration_error": 0.045150343102753177,
+    "positive_rate": 0.26666666666666666,
+    "sample_size": 45
+  },
+  "promotion": {
+    "promote": false,
+    "brier_improvement": 0.19326574372361627,
+    "reasons": [
+      "calibration regression exceeds policy"
+    ]
+  },
+  "sample_decision": {
+    "act": true,
+    "cancellation_probability": 0.2683982683982684,
+    "expected_loss_without_action": 563.6363636363636,
+    "expected_recovered_revenue": 187.40909090909088,
+    "expected_net_value": 175.40909090909088,
+    "reason": "positive expected operational value"
+  }
+}

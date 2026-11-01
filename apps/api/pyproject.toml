@@ -1,0 +1,26 @@
+[project]
+name = "pulseops-api"
+version = "0.1.0"
+description = "PulseOps application API"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "fastapi>=0.128,<1",
+  "uvicorn[standard]>=0.48,<1",
+  "sqlalchemy>=2.0.50,<3",
+  "alembic>=1.18,<2",
+  "pydantic>=2.13,<3",
+  "pydantic-settings>=2.14,<3",
+  "python-multipart>=0.0.20,<1",
+  "psycopg[binary]>=3.2,<4",
+  "oie-core",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pulseops_api"]
+
+[tool.uv.sources]
+oie-core = { workspace = true }

@@ -1,0 +1,46 @@
+[
+  {
+    "opportunity_id": "ee752bf40b9eff94",
+    "category": "capacity",
+    "title": "RM-02 below target utilization",
+    "severity": "high",
+    "confidence": 0.7,
+    "estimated_gain": 12000.0,
+    "score": 50.3,
+    "recommended_actions": [
+      "Review idle windows and compatible exam durations",
+      "Prioritize eligible patients for recovered capacity"
+    ],
+    "evidence": {
+      "equipment_id": "rm-02",
+      "utilization": 0.6,
+      "target_utilization": 0.8,
+      "available_minutes": 600,
+      "realized_minutes": 360,
+      "recoverable_minutes": 120,
+      "revenue_per_realized_minute": 100.0
+    }
+  },
+  {
+    "opportunity_id": "8b3837672812da5e",
+    "category": "capacity",
+    "title": "US-01 below target utilization",
+    "severity": "high",
+    "confidence": 0.7,
+    "estimated_gain": 6200.0,
+    "score": 46.54,
+    "recommended_actions": [
+      "Review idle windows and compatible exam durations",
+      "Prioritize eligible patients for recovered capacity"
+    ],
+    "evidence": {
+      "equipment_id": "us-01",
+      "utilization": 0.5417,
+      "target_utilization": 0.8,
+      "available_minutes": 480,
+      "realized_minutes": 260,
+      "recoverable_minutes": 124,
+      "revenue_per_realized_minute": 50.0
+    }
+  }
+]

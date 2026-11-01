@@ -1,0 +1,5 @@
+equipment_id,equipment_name,equipment_type,available_minutes,booked_minutes,realized_minutes,gross_revenue
+rm-01,RM-01,MRI,600,540,492,51660
+rm-02,RM-02,MRI,600,480,360,36000
+ct-01,CT-01,CT,600,560,510,25500
+us-01,US-01,ULTRASOUND,480,300,260,13000

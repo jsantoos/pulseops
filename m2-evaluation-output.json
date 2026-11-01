@@ -1,0 +1,17 @@
+{
+  "model_version": "bayesian-cancellation-baseline-v1",
+  "feature_set_version": "cancellation-v1",
+  "split": {
+    "train": 90,
+    "validation": 30,
+    "strategy": "temporal"
+  },
+  "metrics": {
+    "brier_score": 0.144717,
+    "log_loss": 0.464813,
+    "calibration_error": 0.061905,
+    "positive_rate": 0.166667,
+    "sample_size": 30
+  },
+  "warning": "Synthetic-data metrics are engineering checks, not evidence of real-world performance."
+}

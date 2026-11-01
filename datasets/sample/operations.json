@@ -1,0 +1,18 @@
+{
+  "equipment": [
+    {"equipment_id": "rm-02", "name": "RM-02", "equipment_type": "MRI", "unit_id": "unit-1"}
+  ],
+  "availability": [
+    {"equipment_id": "rm-02", "starts_at": "2026-08-20T08:00:00", "ends_at": "2026-08-20T18:00:00"}
+  ],
+  "appointments": [
+    {"appointment_id": "a1", "equipment_id": "rm-02", "exam_type": "MRI_KNEE", "scheduled_start": "2026-08-20T08:00:00", "scheduled_duration_minutes": 60, "status": "completed", "expected_revenue": 2000},
+    {"appointment_id": "a2", "equipment_id": "rm-02", "exam_type": "MRI_BRAIN", "scheduled_start": "2026-08-20T09:00:00", "scheduled_duration_minutes": 60, "status": "cancelled", "expected_revenue": 3000},
+    {"appointment_id": "a3", "equipment_id": "rm-02", "exam_type": "MRI_SPINE", "scheduled_start": "2026-08-20T10:00:00", "scheduled_duration_minutes": 60, "status": "no_show", "expected_revenue": 3000},
+    {"appointment_id": "a4", "equipment_id": "rm-02", "exam_type": "MRI_KNEE", "scheduled_start": "2026-08-20T11:00:00", "scheduled_duration_minutes": 60, "status": "confirmed", "expected_revenue": 2000},
+    {"appointment_id": "a5", "equipment_id": "rm-02", "exam_type": "MRI_BRAIN", "scheduled_start": "2026-08-20T12:00:00", "scheduled_duration_minutes": 60, "status": "confirmed", "expected_revenue": 2200}
+  ],
+  "executions": [
+    {"appointment_id": "a1", "actual_start": "2026-08-20T08:05:00", "actual_end": "2026-08-20T08:55:00", "realized_revenue": 2000}
+  ]
+}

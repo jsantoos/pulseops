@@ -1,0 +1,6 @@
+appointment_id,equipment_id,exam_type,scheduled_start,scheduled_duration_minutes,status,expected_revenue,created_at,cancelled_at
+a1,rm-02,MRI_KNEE,2026-08-20T08:00:00,60,completed,2000,,
+a2,rm-02,MRI_BRAIN,2026-08-20T09:00:00,60,cancelled,3000,,
+a3,rm-02,MRI_SPINE,2026-08-20T10:00:00,60,no_show,3000,,
+a4,rm-02,MRI_KNEE,2026-08-20T11:00:00,60,confirmed,2000,,
+a5,rm-02,MRI_BRAIN,2026-08-20T12:00:00,60,confirmed,2200,,
